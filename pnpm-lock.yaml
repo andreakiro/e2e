@@ -254,6 +254,9 @@ importers:
       '@e2e-dev/moli':
         specifier: workspace:*
         version: link:../../packages/moli
+      '@e2e-dev/notte':
+        specifier: workspace:*
+        version: link:../../packages/notte
       '@e2e-dev/web':
         specifier: workspace:*
         version: link:../../packages/web
