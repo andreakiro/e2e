@@ -85,6 +85,7 @@ every tool.
 | --- | --- |
 | [`@e2e-dev/browser-run`](https://www.npmjs.com/package/@e2e-dev/browser-run) | Cloudflare Browser Run hosted Chromium for the web engine. |
 | [`@e2e-dev/kernel`](https://www.npmjs.com/package/@e2e-dev/kernel) | Kernel hosted browsers for the web engine. |
+| [`@e2e-dev/notte`](https://www.npmjs.com/package/@e2e-dev/notte) | Notte cloud browsers for the web engine, one session per test attempt. |
 | [`@e2e-dev/lightpanda`](https://www.npmjs.com/package/@e2e-dev/lightpanda) | Lightpanda, the open-source headless browser, started per run for the web engine. |
 | [`@e2e-dev/moli`](https://www.npmjs.com/package/@e2e-dev/moli) | Local Moli browsers with on-demand layout and screenshots, started per worker slot for the web engine. |
 | [`@e2e-dev/smol`](https://www.npmjs.com/package/@e2e-dev/smol) | smol machines browsers for the web engine: by default, each attempt branches a warm Chromium microVM. |
