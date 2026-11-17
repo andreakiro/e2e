@@ -34,9 +34,10 @@ export interface NotteSessions {
   /** Stops the session; one Notte already closed counts as stopped. Resolves to whether Notte still had it open. */
   stop(sessionId: string, signal: AbortSignal): Promise<boolean>;
   /**
-   * The files the session's browser downloaded, oldest first, in Notte's
-   * listing order when two share a time. Notte collects a finished download
-   * into the session's file storage when this lists it, after the session's
+   * Every file the session's browser downloaded, oldest first, read page by
+   * page. Files that share a time come out in reverse of Notte's listing
+   * order, which is newest first. Notte collects a finished download into
+   * the session's file storage when this lists it, after the session's
    * downloads settle.
    */
   downloads(sessionId: string, signal: AbortSignal): Promise<NotteDownload[]>;
@@ -50,6 +51,9 @@ function alreadyClosed(cause: unknown, statusCode: number | undefined): boolean 
   const text = (cause instanceof Error ? cause.message : String(cause)).toLowerCase();
   return text.includes('already stopped') || text.includes('already closed');
 }
+
+/** How many files one `files.list` request asks for: Notte's own page size. */
+const FILES_PAGE = 100;
 
 /** Notte sessions for one API key and API URL, through the SDK. */
 export function notteSessions(apiKey: string, baseUrl: string | undefined): NotteSessions {
@@ -79,17 +83,23 @@ export function notteSessions(apiKey: string, baseUrl: string | undefined): Nott
     },
     async downloads(sessionId, signal) {
       const { client } = await sdk;
-      const page = await client.files.list(sessionId, { source: 'session_download', limit: 100 }, { signal });
-      // Notte lists newest first: reversed, files that share a time stay oldest first.
-      return page.files
-        .map((file) => ({ id: file.id, filename: file.filename, createdAt: file.created_at }))
-        .toReversed()
-        .toSorted((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+      const listed = new Map<string, NotteDownload>();
+      for (let offset = 0; ; ) {
+        const page = await client.files.list(sessionId, { source: 'session_download', limit: FILES_PAGE, offset }, { signal });
+        // A file stored between two pages shifts the newest-first listing down: the next page repeats one, never skips one.
+        for (const file of page.files) if (!listed.has(file.id)) listed.set(file.id, { id: file.id, filename: file.filename, createdAt: file.created_at });
+        offset += page.files.length;
+        if (page.files.length === 0 || offset >= page.total) break;
+      }
+      // Reversed, then a stable sort by time: files that share a time come out in reverse of Notte's listing order.
+      return [...listed.values()].toReversed().toSorted((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     },
     async readFile(sessionId, fileId, signal) {
       const { client } = await sdk;
-      const blob = (await client.files.download(sessionId, fileId, { signal })) as Blob;
-      return new Uint8Array(await blob.arrayBuffer());
+      // The generated client types the body `unknown`; the typed `Files(id).download` takes no abort signal.
+      const body = await client.files.download(sessionId, fileId, { signal });
+      if (!(body instanceof Blob)) throw new Error(`Notte answered file ${fileId} of session ${sessionId} with no file body`);
+      return new Uint8Array(await body.arrayBuffer());
     },
   };
 }

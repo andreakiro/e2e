@@ -1,9 +1,9 @@
 /** Notte's cloud browsers as a `BrowserProvider` for the web engine. */
 
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { BrowserDownloadContext, BrowserLease, BrowserProvider, BrowserReleaseContext, BrowserRequest } from '@e2e-dev/web';
+import { releaseEach, type BrowserDownloadContext, type BrowserLease, type BrowserProvider, type BrowserReleaseContext, type BrowserRequest } from '@e2e-dev/web';
 import { envValue } from './env.ts';
-import { clear, forget, remember, remembered } from './ledger.ts';
+import { forget, prune, remember, remembered } from './ledger.ts';
 import { notteSessions, type NotteSessionParams, type NotteSessions } from './client.ts';
 
 const NOTTE_API_KEY = 'NOTTE_API_KEY';
@@ -19,12 +19,8 @@ const DOWNLOADS_DIR = '/tmp/session-downloads';
 /** How often `downloads.read` asks Notte again for a download it has not collected yet. */
 const DOWNLOAD_POLL_MS = 500;
 
-/**
- * How long `downloads.read` waits for a file named as the site suggested
- * before it takes the session's one unread file under another name: Notte
- * may store a name the browser would not.
- */
-const DOWNLOAD_NAME_GRACE_MS = 5_000;
+/** An error's message, or the thrown value as text. */
+const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause));
 
 /** The Notte console page of one session, which needs a console sign-in rather than a token. */
 const consoleUrl = (sessionId: string): string => `https://console.notte.cc/sessions/${sessionId}`;
@@ -55,9 +51,7 @@ export function notte(options: NotteOptions = {}): BrowserProvider {
    * The bytes of one download of the lease's session, read once. Notte stores
    * a download under the name the site suggested, not the download id the
    * engine knows, so the file is found by `context.suggestedFilename`: the
-   * oldest unread file of that name. Without a name (an engine older than
-   * that field), or with none of that name after a grace period while the
-   * session holds exactly one unread file, it takes the oldest unread file.
+   * oldest unread file of that name.
    */
   const readDownload = async (lease: BrowserLease, file: string, context: BrowserDownloadContext): Promise<Uint8Array> => {
     const client = clientFor(context.env);
@@ -66,15 +60,8 @@ export function notte(options: NotteOptions = {}): BrowserProvider {
       seen = new Set();
       claimed.set(lease.id, seen);
     }
-    const name = context.suggestedFilename;
-    const started = Date.now();
     for (;;) {
-      const unread = (await client.downloads(lease.id, context.signal)).filter((download) => !seen.has(download.id));
-      const next =
-        name === undefined
-          ? unread[0]
-          : (unread.find((download) => download.filename === name) ??
-            (unread.length === 1 && Date.now() - started >= DOWNLOAD_NAME_GRACE_MS ? unread[0] : undefined));
+      const next = (await client.downloads(lease.id, context.signal)).find((download) => !seen.has(download.id) && download.filename === context.suggestedFilename);
       if (next !== undefined) {
         seen.add(next.id);
         return client.readFile(lease.id, next.id, context.signal);
@@ -104,16 +91,26 @@ export function notte(options: NotteOptions = {}): BrowserProvider {
       const client = clientFor(request.env);
       request.signal.throwIfAborted();
       const session = await client.start(params);
-      await remember(request.runId, request.targetName, session.sessionId);
+      // Recorded before anything can fail, so a worker that dies from here on leaves the session to the sweep.
+      const unrecorded = await remember(request.runId, request.targetName, session.sessionId).then(
+        () => undefined,
+        (cause: unknown) => cause,
+      );
       const { cdpUrl } = session;
-      if (cdpUrl === undefined || request.signal.aborted) {
-        const why = cdpUrl === undefined ? 'started without a CDP URL' : 'arrived after the request was cancelled';
+      if (unrecorded !== undefined || cdpUrl === undefined || request.signal.aborted) {
+        const why =
+          unrecorded !== undefined
+            ? `could not be recorded for the run's sweep (${messageOf(unrecorded)})`
+            : cdpUrl === undefined
+              ? 'started without a CDP URL'
+              : 'arrived after the request was cancelled';
+        const fallback = unrecorded === undefined ? "the run's sweep or Notte's idle_timeout_minutes ends it" : "Notte's idle_timeout_minutes ends it";
         const outcome = await client.stop(session.sessionId, AbortSignal.timeout(10_000)).then(
           async () => {
-            await forget(request.runId, request.targetName, session.sessionId);
+            if (unrecorded === undefined) await forget(request.runId, request.targetName, session.sessionId);
             return 'stopped';
           },
-          (cause: unknown) => `stopping it failed, so the run's sweep or Notte's idle_timeout_minutes ends it: ${cause instanceof Error ? cause.message : String(cause)}`,
+          (cause: unknown) => `stopping it failed, so ${fallback}: ${messageOf(cause)}`,
         );
         throw new Error(`session ${session.sessionId} ${why}; ${outcome}`);
       }
@@ -129,21 +126,20 @@ export function notte(options: NotteOptions = {}): BrowserProvider {
     async sweep(context: BrowserReleaseContext): Promise<readonly string[]> {
       const open = await remembered(context.runId, context.targetName);
       if (open.length === 0) {
-        await clear(context.runId, context.targetName);
+        await prune(context.runId, context.targetName);
         return [];
       }
       const client = clientFor(context.env);
-      const settled = await Promise.allSettled(open.map(async (id) => ((await client.stop(id, context.signal)) ? id : undefined)));
-      const stopped = settled.flatMap((result) => (result.status === 'fulfilled' && result.value !== undefined ? [result.value] : []));
-      const failed = open.flatMap((id, index) => {
-        const result = settled[index]!;
-        return result.status === 'rejected' ? [`${id} (${result.reason instanceof Error ? result.reason.message : String(result.reason)})`] : [];
-      });
-      await clear(context.runId, context.targetName);
+      const { released, failed } = await releaseEach(open, (id) => client.stop(id, context.signal));
+      const unstopped = new Set(failed.map(({ id }) => id));
+      // A marker goes only once Notte confirmed the stop; the marker of a failed stop stays.
+      await Promise.all(open.filter((id) => !unstopped.has(id)).map((id) => forget(context.runId, context.targetName, id)));
+      await prune(context.runId, context.targetName);
       if (failed.length > 0) {
-        throw new Error(`stopped ${stopped.length === 0 ? 'none' : stopped.join(', ')}; could not stop ${failed.join(', ')}, so Notte ends it after idle_timeout_minutes`);
+        const notStopped = failed.map(({ id, reason }) => `${id} (${reason})`).join(', ');
+        throw new Error(`stopped ${released.length === 0 ? 'none' : released.join(', ')}; could not stop ${notStopped}, so Notte ends it after idle_timeout_minutes`);
       }
-      return stopped;
+      return released;
     },
     downloads: { dir: DOWNLOADS_DIR, read: readDownload },
   };

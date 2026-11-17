@@ -31,8 +31,9 @@ managed authentication fields (`auth_ids`, `auth_retry`,
 Each test attempt gets a fresh session, stopped when the attempt ends; a
 Notte session refuses new browser contexts, so the provider leases in
 `attempt` scope only. When the run ends, it stops any session a dead worker
-left. Each session's console link is logged, and `browser.waitForDownload`
-reads files back from the session's storage.
+left. Each session's console link is logged (the session id alone when
+`NOTTE_API_URL` is set), and `browser.waitForDownload` reads files back from
+the session's storage.
 
 Full documentation lives at [e2e.com/docs/integrations/notte](https://e2e.com/docs/integrations/notte).
 

@@ -6,8 +6,8 @@
  * worker left.
  */
 
-import { randomUUID } from 'node:crypto';
-import { rmSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { BrowserDownloadContext, BrowserReleaseContext, BrowserRequest } from '@e2e-dev/web';
@@ -33,6 +33,7 @@ const sdk = vi.hoisted(() => {
     files: new Map<string, { id: string; filename: string; created_at: string; bytes: string }[]>(),
     listed: [] as { sessionId: string; query: unknown }[],
     downloadSignals: [] as (AbortSignal | undefined)[],
+    downloadBody: undefined as unknown,
     debugInfo: async (_id: string): Promise<unknown> => ({ ws: { cdp: '' } }),
   };
   class NotteClient {
@@ -40,13 +41,16 @@ const sdk = vi.hoisted(() => {
       state.clients.push(config);
     }
     files = {
-      list: async (sessionId: string, query: unknown) => {
+      list: async (sessionId: string, query: { limit?: number; offset?: number }) => {
         state.listed.push({ sessionId, query });
-        return { files: (state.files.get(sessionId) ?? []).map(({ bytes: _bytes, ...file }) => file), total: 0, limit: 100 };
+        const all = (state.files.get(sessionId) ?? []).map(({ bytes: _bytes, ...file }) => file);
+        const offset = query.offset ?? 0;
+        const limit = query.limit ?? 100;
+        return { files: all.slice(offset, offset + limit), total: all.length, limit, offset };
       },
       download: async (sessionId: string, fileId: string, options?: { signal?: AbortSignal }) => {
         state.downloadSignals.push(options?.signal);
-        return new Blob([state.files.get(sessionId)?.find((file) => file.id === fileId)?.bytes ?? '']);
+        return state.downloadBody ?? new Blob([state.files.get(sessionId)?.find((file) => file.id === fileId)?.bytes ?? '']);
       },
     };
     sessions = {
@@ -71,7 +75,7 @@ const defaultStop = sdk.state.stop;
 const defaultDebugInfo = sdk.state.debugInfo;
 
 beforeEach(() => {
-  Object.assign(sdk.state, { clients: [], started: [], stopped: [], counter: 0, start: defaultStart, stop: defaultStop, files: new Map(), listed: [], downloadSignals: [], debugInfo: defaultDebugInfo });
+  Object.assign(sdk.state, { clients: [], started: [], stopped: [], counter: 0, start: defaultStart, stop: defaultStop, files: new Map(), listed: [], downloadSignals: [], downloadBody: undefined, debugInfo: defaultDebugInfo });
   runId = `run-${randomUUID()}`;
 });
 
@@ -81,6 +85,9 @@ afterEach(() => {
 
 /** A fresh run per test: the provider keeps its run's open sessions on disk, under the run id. */
 let runId = '';
+
+/** Where the provider keeps the run's markers for target `web`, as `src/ledger.ts` builds it. */
+const markerDir = (): string => path.join(tmpdir(), 'e2e-notte', runId, createHash('sha256').update('web').digest('hex').slice(0, 16));
 
 const env = { NOTTE_API_KEY: 'n-test' };
 
@@ -103,8 +110,8 @@ function releaseContext(): BrowserReleaseContext {
   return { runId, targetName: 'web', env, signal: new AbortController().signal, log: () => undefined };
 }
 
-function downloadContext(suggestedFilename?: string, signal = new AbortController().signal): BrowserDownloadContext {
-  return { runId, targetName: 'web', env, signal, ...(suggestedFilename === undefined ? {} : { suggestedFilename }) };
+function downloadContext(suggestedFilename: string, signal = new AbortController().signal): BrowserDownloadContext {
+  return { runId, targetName: 'web', env, signal, suggestedFilename };
 }
 
 describe('notte()', () => {
@@ -146,6 +153,38 @@ describe('notte()', () => {
     await expect(provider.sweep!(releaseContext())).resolves.toEqual(['s9']);
   });
 
+  it('stops and fails a session whose debug info request fails, rather than surfacing that error', async () => {
+    sdk.state.start = async () => ({ session_id: 's9', status: 'active', cdp_url: null });
+    sdk.state.debugInfo = async () => {
+      throw new Error('debug info 502');
+    };
+    const provider = notte();
+    await expect(provider.acquire(request())).rejects.toThrow('session s9 started without a CDP URL; stopped');
+    expect(sdk.state.stopped.map((stop) => stop.id)).toEqual(['s9']);
+    await expect(provider.sweep!(releaseContext())).resolves.toEqual([]);
+  });
+
+  it('records each session in a marker only the run user can read', async () => {
+    await notte().acquire(request());
+    expect(statSync(markerDir()).mode & 0o777).toBe(0o700);
+    expect(statSync(path.join(markerDir(), 's1')).mode & 0o777).toBe(0o600);
+  });
+
+  it('stops and fails a session it cannot record, instead of running one the sweep would not find', async () => {
+    // A file where the run's directory goes makes the marker unwritable.
+    mkdirSync(path.join(tmpdir(), 'e2e-notte'), { recursive: true });
+    writeFileSync(path.join(tmpdir(), 'e2e-notte', runId), '');
+    await expect(notte().acquire(request())).rejects.toThrow(/^session s1 could not be recorded for the run's sweep \(.+\); stopped$/);
+    expect(sdk.state.stopped.map((stop) => stop.id)).toEqual(['s1']);
+  });
+
+  it('refuses a session id that is not one Notte issues before it names a file after it', async () => {
+    sdk.state.start = async () => ({ session_id: '../escape', status: 'active', cdp_url: 'wss://notte/escape' });
+    await expect(notte().acquire(request())).rejects.toThrow(`session ../escape could not be recorded for the run's sweep (session id "../escape" is not one Notte issues); stopped`);
+    expect(sdk.state.stopped.map((stop) => stop.id)).toEqual(['../escape']);
+    expect(existsSync(path.join(path.dirname(markerDir()), 'escape'))).toBe(false);
+  });
+
   it('stops the session on release, and a session Notte already closed counts as stopped', async () => {
     const provider = notte();
     const lease = await provider.acquire(request());
@@ -171,6 +210,9 @@ describe('notte()', () => {
     await expect(provider.release(lease, releaseContext())).rejects.toThrow('internal');
     sdk.state.stop = async (id) => ({ session_id: id, status: 'active' });
     await expect(provider.release(lease, releaseContext())).rejects.toThrow('session s1 is still active after stop');
+    // Both failed stops kept the marker, so the sweep still finds the session.
+    sdk.state.stop = defaultStop;
+    await expect(provider.sweep!(releaseContext())).resolves.toEqual(['s1']);
   });
 
   it('stops a session that arrived after the request was cancelled', async () => {
@@ -179,7 +221,11 @@ describe('notte()', () => {
       controller.abort();
       return defaultStart(body);
     };
-    await expect(notte().acquire(request({ signal: controller.signal }))).rejects.toThrow('session s1 arrived after the request was cancelled; stopped');
+    const provider = notte();
+    await expect(provider.acquire(request({ signal: controller.signal }))).rejects.toThrow('session s1 arrived after the request was cancelled; stopped');
+    expect(sdk.state.stopped.map((stop) => stop.id)).toEqual(['s1']);
+    // The confirmed stop removed the marker: the sweep has nothing left to stop.
+    await expect(provider.sweep!(releaseContext())).resolves.toEqual([]);
     expect(sdk.state.stopped.map((stop) => stop.id)).toEqual(['s1']);
   });
 
@@ -226,7 +272,7 @@ describe('notte()', () => {
       sdk.state.files.set('s1', [file('f2', 'big.zip', '2026-11-12T10:00:05Z', 'big'), file('f1', 'small.txt', '2026-11-12T10:00:01Z', 'small')]);
       expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/guid-1', downloadContext('big.zip')))).toBe('big');
       expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/guid-2', downloadContext('small.txt')))).toBe('small');
-      expect(sdk.state.listed[0]).toEqual({ sessionId: 's1', query: { source: 'session_download', limit: 100 } });
+      expect(sdk.state.listed[0]).toEqual({ sessionId: 's1', query: { source: 'session_download', limit: 100, offset: 0 } });
       expect(sdk.state.downloadSignals.every((signal) => signal instanceof AbortSignal)).toBe(true);
     });
 
@@ -236,7 +282,7 @@ describe('notte()', () => {
       expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/guid', downloadContext('report.pdf')))).toBe('wanted');
     });
 
-    it('reads two files of one name oldest first, and keeps Notte\'s order between files that share a time', async () => {
+    it('reads two files of one name that share a time in reverse of Notte\'s newest-first listing', async () => {
       const provider = notte();
       // Notte lists newest first.
       sdk.state.files.set('s1', [file('f2', 'a.txt', '2026-11-12T10:00:01Z', 'second'), file('f1', 'a.txt', '2026-11-12T10:00:01Z', 'first')]);
@@ -244,22 +290,26 @@ describe('notte()', () => {
       expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/g2', downloadContext('a.txt')))).toBe('second');
     });
 
-    it('takes the oldest unread file from an engine that names no file', async () => {
+    it('reads two files of one name oldest first by their time, whatever order Notte lists them in', async () => {
       const provider = notte();
-      sdk.state.files.set('s1', [file('f2', 'b.txt', '2026-11-12T10:00:02Z', 'second'), file('f1', 'a.txt', '2026-11-12T10:00:01Z', 'first')]);
-      expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/guid', downloadContext()))).toBe('first');
+      sdk.state.files.set('s1', [file('f1', 'a.txt', '2026-11-12T10:00:01Z', 'older'), file('f2', 'a.txt', '2026-11-12T10:00:05Z', 'newer')]);
+      expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/g1', downloadContext('a.txt')))).toBe('older');
+      expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/g2', downloadContext('a.txt')))).toBe('newer');
     });
 
-    it('takes the one unread file under another name once the grace period passes', async () => {
-      vi.useFakeTimers({ toFake: ['Date'] });
-      try {
-        const provider = notte();
-        sdk.state.files.set('s1', [file('f1', 'renamed.txt', '2026-11-12T10:00:01Z', 'only')]);
-        setTimeout(() => vi.setSystemTime(Date.now() + 6_000), 50);
-        expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/guid', downloadContext('original name.txt')))).toBe('only');
-      } finally {
-        vi.useRealTimers();
-      }
+    it('pages through every stored file, so an old download behind 100 newer ones is still found', async () => {
+      const provider = notte();
+      const newer = Array.from({ length: 150 }, (_, index) => file(`n${index}`, `other-${index}.txt`, `2026-11-12T11:${String(index % 60).padStart(2, '0')}:00Z`, 'other'));
+      sdk.state.files.set('s1', [...newer, file('old', 'wanted.txt', '2026-11-12T10:00:00Z', 'wanted')]);
+      expect(await text(provider.downloads!.read(lease, '/tmp/session-downloads/guid', downloadContext('wanted.txt')))).toBe('wanted');
+      expect(sdk.state.listed.map(({ query }) => (query as { offset: number }).offset)).toEqual([0, 100]);
+    });
+
+    it('fails a file read that brings back no file body', async () => {
+      const provider = notte();
+      sdk.state.files.set('s1', [file('f1', 'a.txt', '2026-11-12T10:00:01Z', 'bytes')]);
+      sdk.state.downloadBody = { not: 'a blob' };
+      await expect(provider.downloads!.read(lease, '/tmp/session-downloads/guid', downloadContext('a.txt'))).rejects.toThrow('Notte answered file f1 of session s1 with no file body');
     });
 
     it('waits for a download Notte has not collected yet, and gives up when the wait is cancelled', async () => {
@@ -307,6 +357,24 @@ describe('notte()', () => {
       };
       await expect(provider.sweep!(releaseContext())).rejects.toThrow('stopped s1; could not stop s2 (internal), so Notte ends it after idle_timeout_minutes');
       expect(sdk.state.stopped.map((stop) => stop.id).toSorted()).toEqual(['s1', 's2', 's3']);
+      // Only the failed stop's marker is left.
+      sdk.state.stop = defaultStop;
+      sdk.state.stopped = [];
+      await expect(provider.sweep!(releaseContext())).resolves.toEqual(['s2']);
+      expect(sdk.state.stopped.map((stop) => stop.id)).toEqual(['s2']);
+    });
+
+    it('surfaces a marker directory it cannot read rather than report no sessions', async () => {
+      mkdirSync(path.dirname(markerDir()), { recursive: true });
+      writeFileSync(markerDir(), '');
+      await expect(notte().sweep!(releaseContext())).rejects.toThrow(/ENOTDIR: not a directory, scandir/);
+    });
+
+    it('removes the run\'s marker directories once every session is stopped', async () => {
+      const provider = notte();
+      await provider.acquire(request());
+      await expect(provider.sweep!(releaseContext())).resolves.toEqual(['s1']);
+      expect(existsSync(path.join(tmpdir(), 'e2e-notte', runId))).toBe(false);
     });
   });
 });
